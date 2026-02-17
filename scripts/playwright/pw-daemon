@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+Playwright browser daemon for persistent sessions.
+This script runs in the background and processes commands from the main CLI.
+"""
+
+import json
+import os
+import sys
+import time
+import signal
+import base64
+from pathlib import Path
+
+# Session files
+TEMP_DIR = Path("/tmp/pw-daemon")
+COMMAND_FILE = TEMP_DIR / "command.json"
+RESULT_FILE = TEMP_DIR / "result.json"
+PID_FILE = TEMP_DIR / "daemon.pid"
+READY_FILE = TEMP_DIR / "ready"
+
+# Global state
+_playwright = None
+_browser = None
+_page = None
+_console_messages = []
+_network_requests = []
+_running = True
+
+
+def write_result(success: bool, result=None, error=None):
+    """Write result to file."""
+    RESULT_FILE.write_text(json.dumps({
+        "success": success,
+        "result": result,
+        "error": error
+    }, indent=2, default=str))
+
+
+def handle_signal(signum, frame):
+    """Handle shutdown signals."""
+    global _running
+    _running = False
+
+
+def init_browser():
+    """Initialize browser."""
+    global _playwright, _browser, _page
+
+    from playwright.sync_api import sync_playwright
+
+    _playwright = sync_playwright().start()
+    _browser = _playwright.chromium.launch(headless=False)
+    context = _browser.new_context(viewport={"width": 1280, "height": 720})
+    _page = context.new_page()
+
+    # Set up console listener
+    def on_console(msg):
+        _console_messages.append({
+            "type": msg.type,
+            "text": msg.text,
+            "location": str(msg.location) if msg.location else None
+        })
+    _page.on("console", on_console)
+
+    # Set up network listener
+    def on_request(request):
+        _network_requests.append({
+            "url": request.url,
+            "method": request.method,
+            "resource_type": request.resource_type
+        })
+    _page.on("request", on_request)
+
+
+def cleanup():
+    """Clean up resources."""
+    global _browser, _playwright
+    if _browser:
+        try:
+            _browser.close()
+        except:
+            pass
+    if _playwright:
+        try:
+            _playwright.stop()
+        except:
+            pass
+    PID_FILE.unlink(missing_ok=True)
+    READY_FILE.unlink(missing_ok=True)
+
+
+# =============================================================================
+# COMMAND HANDLERS
+# =============================================================================
+
+def handle_navigate(args):
+    _page.goto(args["url"], wait_until="networkidle", timeout=30000)
+    return {"success": True, "result": f"Navigated to {args['url']}"}
+
+
+def handle_click(args):
+    click_opts = {}
+    if args.get("double"):
+        click_opts["click_count"] = 2
+    if args.get("button"):
+        click_opts["button"] = args["button"]
+    if args.get("modifiers"):
+        click_opts["modifiers"] = args["modifiers"]
+
+    _page.click(args["selector"], **click_opts)
+    return {"success": True, "result": f"Clicked: {args['selector']}"}
+
+
+def handle_type(args):
+    if args.get("slowly"):
+        _page.type(args["selector"], args["text"], delay=100)
+    else:
+        _page.fill(args["selector"], args["text"])
+
+    if args.get("submit"):
+        _page.press(args["selector"], "Enter")
+
+    return {"success": True, "result": f"Typed into {args['selector']}"}
+
+
+def handle_fill_form(args):
+    fields = json.loads(args["fields_json"])
+    filled = []
+
+    for field in fields:
+        selector = field.get("selector") or field.get("ref")
+        value = field.get("value")
+        field_type = field.get("type", "text")
+
+        if field_type == "checkbox":
+            if value:
+                _page.check(selector)
+            else:
+                _page.uncheck(selector)
+        elif field_type == "radio":
+            _page.click(selector)
+        elif field_type == "select":
+            _page.select_option(selector, value)
+        else:
+            _page.fill(selector, str(value))
+
+        filled.append(selector)
+
+    return {"success": True, "result": f"Filled {len(filled)} fields"}
+
+
+def handle_select(args):
+    _page.select_option(args["selector"], args["value"])
+    return {"success": True, "result": f"Selected '{args['value']}'"}
+
+
+def handle_hover(args):
+    _page.hover(args["selector"])
+    return {"success": True, "result": f"Hovering over {args['selector']}"}
+
+
+def handle_drag(args):
+    _page.drag_and_drop(args["from_selector"], args["to_selector"])
+    return {"success": True, "result": "Drag complete"}
+
+
+def handle_press_key(args):
+    _page.keyboard.press(args["key"])
+    return {"success": True, "result": f"Pressed key: {args['key']}"}
+
+
+def handle_upload(args):
+    with _page.expect_file_chooser() as fc_info:
+        _page.click(args["selector"])
+    file_chooser = fc_info.value
+    file_chooser.set_files(args["files"])
+    return {"success": True, "result": f"Uploaded {len(args['files'])} file(s)"}
+
+
+def handle_evaluate(args):
+    if args.get("selector"):
+        element = _page.locator(args["selector"])
+        result = element.evaluate(args["code"])
+    else:
+        result = _page.evaluate(args["code"])
+    return {"success": True, "result": result}
+
+
+def handle_screenshot(args):
+    screenshot_opts = {"type": args.get("type", "png")}
+
+    if args.get("fullpage"):
+        screenshot_opts["full_page"] = True
+
+    if args.get("output"):
+        screenshot_opts["path"] = args["output"]
+        if args.get("selector"):
+            _page.locator(args["selector"]).screenshot(**screenshot_opts)
+        else:
+            _page.screenshot(**screenshot_opts)
+        return {"success": True, "result": f"Screenshot saved to {args['output']}"}
+    else:
+        if args.get("selector"):
+            data = _page.locator(args["selector"]).screenshot(**screenshot_opts)
+        else:
+            data = _page.screenshot(**screenshot_opts)
+        return {"success": True, "result": {"base64": base64.b64encode(data).decode()}}
+
+
+def handle_snapshot(args):
+    snapshot_script = """
+    () => {
+        function getTree(element, depth = 0) {
+            if (depth > 8) return null;
+
+            const tag = element.tagName.toLowerCase();
+            const role = element.getAttribute('role') || tag;
+            const name = element.getAttribute('aria-label') ||
+                         element.getAttribute('alt') ||
+                         element.getAttribute('title') ||
+                         element.getAttribute('placeholder') ||
+                         (tag === 'input' ? element.value : '') ||
+                         (['a', 'button', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'label', 'span', 'p'].includes(tag) ?
+                          element.textContent?.trim().slice(0, 80) : '');
+
+            const isInteractive = ['a', 'button', 'input', 'select', 'textarea', 'details', 'summary'].includes(tag) ||
+                                  element.getAttribute('role') ||
+                                  element.getAttribute('onclick') ||
+                                  element.hasAttribute('tabindex');
+
+            const node = {
+                tag: tag,
+                ...(role !== tag && { role: role }),
+                ...(name && { name: name }),
+                ...(element.id && { id: element.id }),
+                ...(element.className && typeof element.className === 'string' &&
+                    element.className.trim() && { class: element.className.split(' ').slice(0, 2).join(' ') }),
+                ...(tag === 'a' && { href: element.getAttribute('href')?.slice(0, 50) }),
+                ...(tag === 'input' && { type: element.type, inputName: element.name }),
+                ...(tag === 'img' && { src: element.src?.slice(0, 50) }),
+            };
+
+            const structuralTags = ['div', 'section', 'main', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li',
+                                    'article', 'aside', 'table', 'tbody', 'tr', 'td', 'th'];
+
+            const children = Array.from(element.children)
+                .map(child => getTree(child, depth + 1))
+                .filter(c => c !== null);
+
+            if (children.length > 0) {
+                node.children = children;
+            }
+
+            if (isInteractive || children.length > 0 || name) {
+                return node;
+            }
+            return null;
+        }
+
+        return {
+            url: window.location.href,
+            title: document.title,
+            tree: getTree(document.body)
+        };
+    }
+    """
+
+    snapshot = _page.evaluate(snapshot_script)
+
+    if args.get("output"):
+        Path(args["output"]).write_text(json.dumps(snapshot, indent=2))
+        return {"success": True, "result": f"Snapshot saved to {args['output']}"}
+    else:
+        return {"success": True, "result": snapshot}
+
+
+def handle_resize(args):
+    _page.set_viewport_size({"width": args["width"], "height": args["height"]})
+    return {"success": True, "result": f"Resized to {args['width']}x{args['height']}"}
+
+
+def handle_close(args):
+    global _browser, _page, _playwright, _running
+    if _browser:
+        _browser.close()
+        _browser = None
+        _page = None
+    _running = False
+    return {"success": True, "result": "Browser closed"}
+
+
+def handle_back(args):
+    _page.go_back()
+    return {"success": True, "result": "Navigated back"}
+
+
+def handle_dialog(args):
+    def handle_dialog_event(dialog):
+        if args["action"] == "accept":
+            if args.get("text"):
+                dialog.accept(args["text"])
+            else:
+                dialog.accept()
+        else:
+            dialog.dismiss()
+
+    _page.on("dialog", handle_dialog_event)
+    return {"success": True, "result": f"Dialog handler set to {args['action']}"}
+
+
+def handle_wait(args):
+    if args.get("text"):
+        _page.wait_for_selector(f"text={args['text']}", timeout=args.get("timeout", 30000))
+        return {"success": True, "result": f"Found text: {args['text']}"}
+    elif args.get("gone"):
+        _page.wait_for_selector(f"text={args['gone']}", state="hidden", timeout=args.get("timeout", 30000))
+        return {"success": True, "result": f"Text gone: {args['gone']}"}
+    elif args.get("time"):
+        time.sleep(args["time"])
+        return {"success": True, "result": f"Waited {args['time']} seconds"}
+    else:
+        _page.wait_for_load_state("networkidle")
+        return {"success": True, "result": "Page loaded"}
+
+
+def handle_console(args):
+    level = args.get("level", "info")
+    levels = {"error": 0, "warning": 1, "info": 2, "debug": 3}
+    target_level = levels.get(level, 2)
+
+    filtered = [m for m in _console_messages if levels.get(m["type"], 2) <= target_level]
+    return {"success": True, "result": {"messages": filtered[-50:]}}  # Last 50
+
+
+def handle_network(args):
+    include_static = args.get("include_static", False)
+    static_ext = ['.js', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.ttf', '.ico']
+
+    if include_static:
+        filtered = _network_requests
+    else:
+        filtered = [r for r in _network_requests if not any(r["url"].lower().endswith(ext) for ext in static_ext)]
+
+    return {"success": True, "result": {"requests": filtered[-50:]}}  # Last 50
+
+
+def handle_tabs(args):
+    global _page
+    context = _browser.contexts[0] if _browser.contexts else None
+    if not context:
+        return {"success": False, "error": "No browser context"}
+
+    action = args["action"]
+
+    if action == "list":
+        tabs = [{"index": i, "url": p.url, "title": p.title()} for i, p in enumerate(context.pages)]
+        return {"success": True, "result": tabs}
+
+    elif action == "new":
+        _page = context.new_page()
+        return {"success": True, "result": f"Created new tab (index {len(context.pages) - 1})"}
+
+    elif action == "close":
+        if args.get("index") is not None:
+            pages = context.pages
+            if 0 <= args["index"] < len(pages):
+                target = pages[args["index"]]
+                target.close()
+                if _page == target and context.pages:
+                    _page = context.pages[0]
+                return {"success": True, "result": f"Closed tab {args['index']}"}
+            else:
+                return {"success": False, "error": f"Invalid tab index: {args['index']}"}
+        else:
+            _page.close()
+            if context.pages:
+                _page = context.pages[0]
+            return {"success": True, "result": "Closed current tab"}
+
+    elif action == "select":
+        if args.get("index") is not None:
+            pages = context.pages
+            if 0 <= args["index"] < len(pages):
+                _page = pages[args["index"]]
+                _page.bring_to_front()
+                return {"success": True, "result": f"Selected tab {args['index']}"}
+            else:
+                return {"success": False, "error": f"Invalid tab index: {args['index']}"}
+        else:
+            return {"success": False, "error": "Tab index required for select"}
+
+
+def handle_run_code(args):
+    local_vars = {"page": _page, "browser": _browser, "result": None}
+    exec(args["code"], {"__builtins__": __builtins__}, local_vars)
+    return {"success": True, "result": local_vars.get("result", "Code executed")}
+
+
+# Command dispatch
+HANDLERS = {
+    "navigate": handle_navigate,
+    "click": handle_click,
+    "type": handle_type,
+    "fill_form": handle_fill_form,
+    "select": handle_select,
+    "hover": handle_hover,
+    "drag": handle_drag,
+    "press_key": handle_press_key,
+    "upload": handle_upload,
+    "evaluate": handle_evaluate,
+    "screenshot": handle_screenshot,
+    "snapshot": handle_snapshot,
+    "resize": handle_resize,
+    "close": handle_close,
+    "back": handle_back,
+    "dialog": handle_dialog,
+    "wait": handle_wait,
+    "console": handle_console,
+    "network": handle_network,
+    "tabs": handle_tabs,
+    "run_code": handle_run_code,
+}
+
+
+def main():
+    global _running
+
+    # Set up signal handlers
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    # Create temp directory
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write PID
+    PID_FILE.write_text(str(os.getpid()))
+
+    try:
+        # Initialize browser
+        init_browser()
+
+        # Signal ready
+        READY_FILE.touch()
+
+        # Main loop
+        while _running:
+            if COMMAND_FILE.exists():
+                try:
+                    cmd_data = json.loads(COMMAND_FILE.read_text())
+                    COMMAND_FILE.unlink()
+
+                    command = cmd_data.get("command")
+                    args = cmd_data.get("args", {})
+
+                    handler = HANDLERS.get(command)
+                    if handler:
+                        try:
+                            result = handler(args)
+                            write_result(result.get("success", True), result.get("result"), result.get("error"))
+                        except Exception as e:
+                            write_result(False, error=str(e))
+                    else:
+                        write_result(False, error=f"Unknown command: {command}")
+
+                except json.JSONDecodeError as e:
+                    write_result(False, error=f"Invalid command JSON: {e}")
+                except Exception as e:
+                    write_result(False, error=str(e))
+
+            time.sleep(0.05)  # 50ms poll interval
+
+    finally:
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

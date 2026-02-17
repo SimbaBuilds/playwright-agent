@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""
+Playwright CLI wrapper for Claude Code sub-agents.
+Provides browser automation without MCP context bloat.
+
+Uses a daemon process to maintain persistent browser sessions.
+
+Usage:
+    ./pw <command> [arguments]
+
+Examples:
+    ./pw navigate "http://localhost:3000"
+    ./pw snapshot
+    ./pw click "button:has-text('Login')"
+    ./pw type "#email" "user@example.com"
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import subprocess
+import signal
+from pathlib import Path
+
+# Session files
+TEMP_DIR = Path("/tmp/pw-daemon")
+COMMAND_FILE = TEMP_DIR / "command.json"
+RESULT_FILE = TEMP_DIR / "result.json"
+PID_FILE = TEMP_DIR / "daemon.pid"
+READY_FILE = TEMP_DIR / "ready"
+
+
+def output(success: bool, result=None, error=None):
+    """Output JSON result and exit."""
+    print(json.dumps({
+        "success": success,
+        "result": result,
+        "error": error
+    }, indent=2, default=str))
+    sys.exit(0 if success else 1)
+
+
+def is_daemon_running():
+    """Check if daemon is running."""
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)  # Check if process exists
+        return True
+    except (ProcessLookupError, ValueError):
+        PID_FILE.unlink(missing_ok=True)
+        return False
+
+
+def start_daemon():
+    """Start the browser daemon."""
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Clean up old files
+    COMMAND_FILE.unlink(missing_ok=True)
+    RESULT_FILE.unlink(missing_ok=True)
+    READY_FILE.unlink(missing_ok=True)
+
+    # Start daemon in background
+    daemon_script = Path(__file__).parent / "pw-daemon"
+    subprocess.Popen(
+        [sys.executable, str(daemon_script)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+    # Wait for daemon to be ready
+    for _ in range(100):  # 10 seconds max
+        if READY_FILE.exists():
+            return True
+        time.sleep(0.1)
+
+    return False
+
+
+def send_command(cmd: str, args: dict) -> dict:
+    """Send command to daemon and get result."""
+    # Ensure daemon is running
+    if not is_daemon_running():
+        if not start_daemon():
+            return {"success": False, "error": "Failed to start daemon"}
+
+    # Clear old result
+    RESULT_FILE.unlink(missing_ok=True)
+
+    # Write command
+    COMMAND_FILE.write_text(json.dumps({
+        "command": cmd,
+        "args": args
+    }))
+
+    # Wait for result
+    for _ in range(600):  # 60 seconds max
+        if RESULT_FILE.exists():
+            try:
+                result = json.loads(RESULT_FILE.read_text())
+                RESULT_FILE.unlink(missing_ok=True)
+                return result
+            except json.JSONDecodeError:
+                time.sleep(0.1)
+                continue
+        time.sleep(0.1)
+
+    return {"success": False, "error": "Command timeout"}
+
+
+# =============================================================================
+# COMMAND HANDLERS (send to daemon)
+# =============================================================================
+
+def cmd_navigate(args):
+    result = send_command("navigate", {"url": args.url})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_click(args):
+    result = send_command("click", {
+        "selector": args.selector,
+        "double": args.double,
+        "button": args.button,
+        "modifiers": args.modifiers
+    })
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_type(args):
+    result = send_command("type", {
+        "selector": args.selector,
+        "text": args.text,
+        "submit": args.submit,
+        "slowly": args.slowly
+    })
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_fill_form(args):
+    result = send_command("fill_form", {"fields_json": args.fields_json})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_select(args):
+    result = send_command("select", {"selector": args.selector, "value": args.value})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_hover(args):
+    result = send_command("hover", {"selector": args.selector})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_drag(args):
+    result = send_command("drag", {
+        "from_selector": args.from_selector,
+        "to_selector": args.to_selector
+    })
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_press_key(args):
+    result = send_command("press_key", {"key": args.key})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_upload(args):
+    result = send_command("upload", {"selector": args.selector, "files": args.files})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_evaluate(args):
+    result = send_command("evaluate", {"code": args.code, "selector": args.selector})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_screenshot(args):
+    result = send_command("screenshot", {
+        "selector": args.selector,
+        "fullpage": args.fullpage,
+        "output": args.output,
+        "type": args.type
+    })
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_snapshot(args):
+    result = send_command("snapshot", {"output": args.output})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_resize(args):
+    result = send_command("resize", {"width": args.width, "height": args.height})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_close(args):
+    result = send_command("close", {})
+    # Also kill daemon
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            os.kill(pid, signal.SIGTERM)
+        except:
+            pass
+        PID_FILE.unlink(missing_ok=True)
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_back(args):
+    result = send_command("back", {})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_dialog(args):
+    result = send_command("dialog", {"action": args.action, "text": args.text})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_wait(args):
+    result = send_command("wait", {
+        "text": args.text,
+        "gone": args.gone,
+        "time": args.time,
+        "timeout": args.timeout
+    })
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_console(args):
+    result = send_command("console", {"level": args.level})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_network(args):
+    result = send_command("network", {"include_static": args.include_static})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_tabs(args):
+    result = send_command("tabs", {"action": args.action, "index": args.index})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+def cmd_install(args):
+    import subprocess
+    res = subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        capture_output=True,
+        text=True
+    )
+    if res.returncode == 0:
+        output(True, "Chromium installed")
+    else:
+        output(False, error=res.stderr)
+
+
+def cmd_run_code(args):
+    result = send_command("run_code", {"code": args.code})
+    output(result.get("success", False), result.get("result"), result.get("error"))
+
+
+# =============================================================================
+# CLI ARGUMENT PARSING
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Playwright CLI for Claude Code sub-agents",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # navigate
+    p = subparsers.add_parser("navigate", help="Navigate to URL")
+    p.add_argument("url", help="URL to navigate to")
+    p.set_defaults(func=cmd_navigate)
+
+    # click
+    p = subparsers.add_parser("click", help="Click element")
+    p.add_argument("selector", help="Element selector")
+    p.add_argument("--double", action="store_true", help="Double click")
+    p.add_argument("--button", choices=["left", "right", "middle"], default="left")
+    p.add_argument("--modifiers", nargs="*", help="Modifier keys")
+    p.set_defaults(func=cmd_click)
+
+    # type
+    p = subparsers.add_parser("type", help="Type text into input")
+    p.add_argument("selector", help="Input selector")
+    p.add_argument("text", help="Text to type")
+    p.add_argument("--submit", action="store_true", help="Press Enter after typing")
+    p.add_argument("--slowly", action="store_true", help="Type slowly (with delay)")
+    p.set_defaults(func=cmd_type)
+
+    # fill-form
+    p = subparsers.add_parser("fill-form", help="Fill multiple form fields")
+    p.add_argument("fields_json", help='JSON array of fields: [{"selector": "...", "value": "..."}]')
+    p.set_defaults(func=cmd_fill_form)
+
+    # select
+    p = subparsers.add_parser("select", help="Select dropdown option")
+    p.add_argument("selector", help="Select element selector")
+    p.add_argument("value", help="Option value to select")
+    p.set_defaults(func=cmd_select)
+
+    # hover
+    p = subparsers.add_parser("hover", help="Hover over element")
+    p.add_argument("selector", help="Element selector")
+    p.set_defaults(func=cmd_hover)
+
+    # drag
+    p = subparsers.add_parser("drag", help="Drag and drop")
+    p.add_argument("from_selector", help="Source element selector")
+    p.add_argument("to_selector", help="Target element selector")
+    p.set_defaults(func=cmd_drag)
+
+    # press-key
+    p = subparsers.add_parser("press-key", help="Press keyboard key")
+    p.add_argument("key", help="Key to press (Enter, Tab, Escape, etc.)")
+    p.set_defaults(func=cmd_press_key)
+
+    # upload
+    p = subparsers.add_parser("upload", help="Upload files")
+    p.add_argument("selector", help="File input selector")
+    p.add_argument("files", nargs="+", help="File paths to upload")
+    p.set_defaults(func=cmd_upload)
+
+    # evaluate
+    p = subparsers.add_parser("evaluate", help="Evaluate JavaScript")
+    p.add_argument("code", help="JavaScript code to evaluate")
+    p.add_argument("--selector", help="Element to evaluate on")
+    p.set_defaults(func=cmd_evaluate)
+
+    # screenshot
+    p = subparsers.add_parser("screenshot", help="Take screenshot")
+    p.add_argument("--selector", help="Element to screenshot")
+    p.add_argument("--fullpage", action="store_true", help="Full page screenshot")
+    p.add_argument("--output", "-o", help="Output file path")
+    p.add_argument("--type", choices=["png", "jpeg"], default="png")
+    p.set_defaults(func=cmd_screenshot)
+
+    # snapshot
+    p = subparsers.add_parser("snapshot", help="Get accessibility snapshot")
+    p.add_argument("--output", "-o", help="Output file path")
+    p.set_defaults(func=cmd_snapshot)
+
+    # resize
+    p = subparsers.add_parser("resize", help="Resize browser window")
+    p.add_argument("width", type=int, help="Window width")
+    p.add_argument("height", type=int, help="Window height")
+    p.set_defaults(func=cmd_resize)
+
+    # close
+    p = subparsers.add_parser("close", help="Close browser")
+    p.set_defaults(func=cmd_close)
+
+    # back
+    p = subparsers.add_parser("back", help="Navigate back")
+    p.set_defaults(func=cmd_back)
+
+    # dialog
+    p = subparsers.add_parser("dialog", help="Handle dialog")
+    p.add_argument("action", choices=["accept", "dismiss"], help="Accept or dismiss")
+    p.add_argument("--text", help="Text for prompt dialogs")
+    p.set_defaults(func=cmd_dialog)
+
+    # wait
+    p = subparsers.add_parser("wait", help="Wait for condition")
+    p.add_argument("--text", help="Wait for text to appear")
+    p.add_argument("--gone", help="Wait for text to disappear")
+    p.add_argument("--time", type=float, help="Wait for seconds")
+    p.add_argument("--timeout", type=int, default=30000, help="Timeout in ms")
+    p.set_defaults(func=cmd_wait)
+
+    # console
+    p = subparsers.add_parser("console", help="Get console messages")
+    p.add_argument("--level", choices=["error", "warning", "info", "debug"], default="info")
+    p.set_defaults(func=cmd_console)
+
+    # network
+    p = subparsers.add_parser("network", help="Get network requests")
+    p.add_argument("--include-static", action="store_true", help="Include static resources")
+    p.set_defaults(func=cmd_network)
+
+    # tabs
+    p = subparsers.add_parser("tabs", help="Manage browser tabs")
+    p.add_argument("action", choices=["list", "new", "close", "select"])
+    p.add_argument("--index", type=int, help="Tab index")
+    p.set_defaults(func=cmd_tabs)
+
+    # install
+    p = subparsers.add_parser("install", help="Install browser")
+    p.set_defaults(func=cmd_install)
+
+    # run-code
+    p = subparsers.add_parser("run-code", help="Run arbitrary Playwright code")
+    p.add_argument("code", help="Python code using 'page' and 'browser' objects")
+    p.set_defaults(func=cmd_run_code)
+
+    # Parse and execute
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        args.func(args)
+    except Exception as e:
+        output(False, error=str(e))
+
+
+if __name__ == "__main__":
+    main()

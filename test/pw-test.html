@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Playwright Skill Test Page</title>
+    <style>
+        * { box-sizing: border-box; font-family: system-ui, sans-serif; }
+        body { margin: 0; padding: 20px; background: #f5f5f5; }
+        h1 { color: #333; border-bottom: 2px solid #4f46e5; padding-bottom: 10px; }
+        h2 { color: #4f46e5; margin-top: 30px; }
+        .section { background: white; padding: 20px; margin: 10px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        button { background: #4f46e5; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 5px; }
+        button:hover { background: #4338ca; }
+        button.secondary { background: #6b7280; }
+        button.danger { background: #dc2626; }
+        input, textarea, select { padding: 10px; border: 1px solid #d1d5db; border-radius: 5px; margin: 5px; }
+        label { display: block; margin: 10px 0 5px; font-weight: 500; }
+        .result { background: #f3f4f6; padding: 15px; border-radius: 5px; margin-top: 10px; font-family: monospace; min-height: 40px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 20px; }
+        .hover-target { padding: 20px; background: #fef3c7; border-radius: 5px; display: inline-block; position: relative; }
+        .hover-target .tooltip { display: none; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #1f2937; color: white; padding: 10px; border-radius: 5px; margin-bottom: 5px; }
+        .hover-target:hover .tooltip { display: block; }
+        .drag-area { display: flex; gap: 20px; margin: 20px 0; }
+        .drag-zone { width: 150px; height: 100px; border: 2px dashed #d1d5db; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
+        .draggable { width: 60px; height: 60px; background: #4f46e5; color: white; border-radius: 8px; display: flex; align-items: center; justify-content: center; cursor: grab; }
+        .drop-zone { background: #dcfce7; border-color: #16a34a; }
+        #delayed-element { display: none; padding: 15px; background: #dcfce7; border-radius: 5px; margin-top: 10px; }
+        nav { background: #1f2937; padding: 15px; margin: -20px -20px 20px; }
+        nav a { color: white; text-decoration: none; margin-right: 15px; padding: 8px 15px; border-radius: 5px; }
+        nav a:hover, nav a.active { background: #4f46e5; }
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="#" class="active">Test Home</a>
+        <a href="#forms">Forms</a>
+        <a href="#interactions">Interactions</a>
+    </nav>
+
+    <h1>Playwright Skill Test Page</h1>
+    <p>Test all 22 commands here.</p>
+
+    <div class="grid">
+        <!-- Click Tests -->
+        <div class="section" id="click-tests">
+            <h2>1. Click Tests</h2>
+            <button id="single-click" onclick="log('click', 'Single click!')">Single Click</button>
+            <button id="double-click" ondblclick="log('click', 'Double click!')">Double Click</button>
+            <button id="right-click" oncontextmenu="log('click', 'Right click!'); return false;">Right Click</button>
+            <div class="result" id="click-result">Click result here</div>
+        </div>
+
+        <!-- Type Tests -->
+        <div class="section" id="type-tests">
+            <h2>2. Type Tests</h2>
+            <label>Text: <input type="text" id="text-input" placeholder="Type here..." oninput="updateType()"></label>
+            <label>Email: <input type="email" id="email-input" placeholder="email@example.com" oninput="updateType()"></label>
+            <label>Password: <input type="password" id="password-input" placeholder="Password" oninput="updateType()"></label>
+            <div class="result" id="type-result">Typed content here</div>
+        </div>
+
+        <!-- Form Tests -->
+        <div class="section" id="form-tests">
+            <h2>3. Form Tests</h2>
+            <form id="test-form" onsubmit="submitForm(event)">
+                <label>Name: <input type="text" id="form-name" name="name"></label>
+                <label>Email: <input type="email" id="form-email" name="email"></label>
+                <label><input type="checkbox" id="form-terms" name="terms"> Agree to terms</label>
+                <label><input type="radio" name="plan" value="basic" id="plan-basic"> Basic</label>
+                <label><input type="radio" name="plan" value="pro" id="plan-pro"> Pro</label>
+                <button type="submit">Submit Form</button>
+            </form>
+            <div class="result" id="form-result">Form result here</div>
+        </div>
+
+        <!-- Select Tests -->
+        <div class="section" id="select-tests">
+            <h2>4. Select Tests</h2>
+            <label>Country:
+                <select id="country-select" onchange="updateSelect()">
+                    <option value="">Choose...</option>
+                    <option value="us">United States</option>
+                    <option value="uk">United Kingdom</option>
+                    <option value="ca">Canada</option>
+                </select>
+            </label>
+            <div class="result" id="select-result">Selection here</div>
+        </div>
+
+        <!-- Hover Tests -->
+        <div class="section" id="hover-tests">
+            <h2>5. Hover Tests</h2>
+            <div class="hover-target" id="hover-tooltip">
+                Hover over me!
+                <div class="tooltip">Tooltip visible!</div>
+            </div>
+        </div>
+
+        <!-- Drag Tests -->
+        <div class="section" id="drag-tests">
+            <h2>6. Drag Tests</h2>
+            <div class="drag-area">
+                <div class="drag-zone" id="drag-source">
+                    <div class="draggable" id="draggable" draggable="true">Drag</div>
+                </div>
+                <div class="drag-zone drop-zone" id="drop-target">Drop</div>
+            </div>
+            <div class="result" id="drag-result">Drag result here</div>
+        </div>
+
+        <!-- Keyboard Tests -->
+        <div class="section" id="keyboard-tests">
+            <h2>7. Keyboard Tests</h2>
+            <label>Press keys: <input type="text" id="key-input" onkeydown="logKey(event)"></label>
+            <div class="result" id="key-result">Key press here</div>
+        </div>
+
+        <!-- Upload Tests -->
+        <div class="section" id="upload-tests">
+            <h2>8. Upload Tests</h2>
+            <label>File: <input type="file" id="file-input" onchange="logFile(this)"></label>
+            <div class="result" id="upload-result">Upload result here</div>
+        </div>
+
+        <!-- Dialog Tests -->
+        <div class="section" id="dialog-tests">
+            <h2>9. Dialog Tests</h2>
+            <button onclick="alert('Hello!')">Alert</button>
+            <button onclick="log('dialog', 'Confirm: ' + confirm('OK?'))" class="secondary">Confirm</button>
+            <button onclick="log('dialog', 'Prompt: ' + prompt('Name?'))" class="secondary">Prompt</button>
+            <div class="result" id="dialog-result">Dialog result here</div>
+        </div>
+
+        <!-- Wait Tests -->
+        <div class="section" id="wait-tests">
+            <h2>10. Wait Tests</h2>
+            <button onclick="showDelayed()">Show After 2s</button>
+            <button onclick="hideDelayed()" class="secondary">Hide After 2s</button>
+            <div id="delayed-element">I appeared!</div>
+            <div class="result" id="wait-result">Wait result here</div>
+        </div>
+
+        <!-- Console Tests -->
+        <div class="section" id="console-tests">
+            <h2>11. Console Tests</h2>
+            <button onclick="console.log('Info log')">Log Info</button>
+            <button onclick="console.warn('Warning')" class="secondary">Log Warn</button>
+            <button onclick="console.error('Error')" class="danger">Log Error</button>
+        </div>
+
+        <!-- Network Tests -->
+        <div class="section" id="network-tests">
+            <h2>12. Network Tests</h2>
+            <button onclick="fetchData()">Fetch Data</button>
+            <div class="result" id="network-result">Network result here</div>
+        </div>
+
+        <!-- Evaluate Tests -->
+        <div class="section" id="evaluate-tests">
+            <h2>13. Evaluate Tests</h2>
+            <div id="eval-target" data-value="42">Target (data-value=42)</div>
+            <ul id="eval-list"><li>One</li><li>Two</li><li>Three</li></ul>
+        </div>
+
+        <!-- Resize Tests -->
+        <div class="section" id="resize-tests">
+            <h2>14. Viewport Tests</h2>
+            <p>Size: <span id="viewport-size"></span></p>
+            <div id="responsive" style="padding: 20px; border-radius: 5px;"></div>
+        </div>
+
+        <!-- Screenshot Target -->
+        <div class="section" id="screenshot-tests">
+            <h2>15. Screenshot Target</h2>
+            <div id="screenshot-target" style="background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; padding: 30px; border-radius: 10px; text-align: center;">
+                Screenshot This
+            </div>
+        </div>
+    </div>
+
+    <footer style="text-align: center; padding: 40px; margin-top: 40px; background: #1f2937; color: white;">
+        Playwright Skill Test Page
+    </footer>
+
+    <script>
+        // Helpers
+        function log(section, msg) {
+            document.getElementById(section + '-result').textContent = msg + ' @ ' + new Date().toLocaleTimeString();
+        }
+
+        function updateType() {
+            const t = document.getElementById('text-input').value;
+            const e = document.getElementById('email-input').value;
+            document.getElementById('type-result').textContent = JSON.stringify({text: t, email: e});
+        }
+
+        function updateSelect() {
+            document.getElementById('select-result').textContent = document.getElementById('country-select').value;
+        }
+
+        function submitForm(e) {
+            e.preventDefault();
+            const data = Object.fromEntries(new FormData(e.target));
+            document.getElementById('form-result').textContent = JSON.stringify(data);
+        }
+
+        function logKey(e) {
+            document.getElementById('key-result').textContent = `Key: ${e.key}, Code: ${e.code}`;
+        }
+
+        function logFile(input) {
+            const files = Array.from(input.files).map(f => f.name);
+            document.getElementById('upload-result').textContent = files.join(', ');
+        }
+
+        function showDelayed() {
+            document.getElementById('wait-result').textContent = 'Waiting...';
+            setTimeout(() => {
+                document.getElementById('delayed-element').style.display = 'block';
+                document.getElementById('wait-result').textContent = 'Visible!';
+            }, 2000);
+        }
+
+        function hideDelayed() {
+            setTimeout(() => {
+                document.getElementById('delayed-element').style.display = 'none';
+                document.getElementById('wait-result').textContent = 'Hidden!';
+            }, 2000);
+        }
+
+        async function fetchData() {
+            document.getElementById('network-result').textContent = 'Fetching...';
+            try {
+                const r = await fetch('https://api.github.com/zen');
+                document.getElementById('network-result').textContent = await r.text();
+            } catch (e) {
+                document.getElementById('network-result').textContent = 'Fetch attempted';
+            }
+        }
+
+        // Viewport
+        function updateViewport() {
+            document.getElementById('viewport-size').textContent = `${innerWidth}x${innerHeight}`;
+            const r = document.getElementById('responsive');
+            r.style.background = innerWidth < 640 ? '#ef4444' : innerWidth < 1024 ? '#f59e0b' : '#22c55e';
+            r.textContent = innerWidth < 640 ? 'Mobile' : innerWidth < 1024 ? 'Tablet' : 'Desktop';
+        }
+        updateViewport();
+        addEventListener('resize', updateViewport);
+
+        // Drag
+        const drag = document.getElementById('draggable');
+        const drop = document.getElementById('drop-target');
+        drag.ondragstart = () => log('drag', 'Started');
+        drop.ondragover = e => e.preventDefault();
+        drop.ondrop = () => { drop.appendChild(drag); log('drag', 'Dropped!'); };
+    </script>
+</body>
+</html>
