@@ -32,13 +32,17 @@ PID_FILE = TEMP_DIR / "daemon.pid"
 READY_FILE = TEMP_DIR / "ready"
 
 
-def output(success: bool, result=None, error=None):
+def output(success: bool, result=None, error=None, snapshot=None):
     """Output JSON result and exit."""
-    print(json.dumps({
+    out = {
         "success": success,
         "result": result,
         "error": error
-    }, indent=2, default=str))
+    }
+    if snapshot:
+        out["snapshot"] = snapshot
+
+    print(json.dumps(out, indent=2, default=str))
     sys.exit(0 if success else 1)
 
 
@@ -118,28 +122,34 @@ def send_command(cmd: str, args: dict) -> dict:
 # =============================================================================
 
 def cmd_navigate(args):
-    result = send_command("navigate", {"url": args.url})
-    output(result.get("success", False), result.get("result"), result.get("error"))
+    result = send_command("navigate", {"url": args.url, "snapshot": not args.no_snapshot})
+    output(result.get("success", False), result.get("result"), result.get("error"), result.get("snapshot"))
 
 
 def cmd_click(args):
+    # Support both --ref and positional selector
+    selector = getattr(args, 'ref', None) or args.selector
     result = send_command("click", {
-        "selector": args.selector,
+        "selector": selector,
         "double": args.double,
         "button": args.button,
-        "modifiers": args.modifiers
+        "modifiers": args.modifiers,
+        "snapshot": not args.no_snapshot
     })
-    output(result.get("success", False), result.get("result"), result.get("error"))
+    output(result.get("success", False), result.get("result"), result.get("error"), result.get("snapshot"))
 
 
 def cmd_type(args):
+    # Support both --ref and positional selector
+    selector = getattr(args, 'ref', None) or args.selector
     result = send_command("type", {
-        "selector": args.selector,
+        "selector": selector,
         "text": args.text,
         "submit": args.submit,
-        "slowly": args.slowly
+        "slowly": args.slowly,
+        "snapshot": not args.no_snapshot
     })
-    output(result.get("success", False), result.get("result"), result.get("error"))
+    output(result.get("success", False), result.get("result"), result.get("error"), result.get("snapshot"))
 
 
 def cmd_fill_form(args):
@@ -148,13 +158,22 @@ def cmd_fill_form(args):
 
 
 def cmd_select(args):
-    result = send_command("select", {"selector": args.selector, "value": args.value})
-    output(result.get("success", False), result.get("result"), result.get("error"))
+    selector = getattr(args, 'ref', None) or args.selector
+    result = send_command("select", {
+        "selector": selector,
+        "value": args.value,
+        "snapshot": not args.no_snapshot
+    })
+    output(result.get("success", False), result.get("result"), result.get("error"), result.get("snapshot"))
 
 
 def cmd_hover(args):
-    result = send_command("hover", {"selector": args.selector})
-    output(result.get("success", False), result.get("result"), result.get("error"))
+    selector = getattr(args, 'ref', None) or args.selector
+    result = send_command("hover", {
+        "selector": selector,
+        "snapshot": not args.no_snapshot
+    })
+    output(result.get("success", False), result.get("result"), result.get("error"), result.get("snapshot"))
 
 
 def cmd_drag(args):
@@ -281,22 +300,27 @@ def main():
     # navigate
     p = subparsers.add_parser("navigate", help="Navigate to URL")
     p.add_argument("url", help="URL to navigate to")
+    p.add_argument("--no-snapshot", action="store_true", help="Don't include snapshot in result")
     p.set_defaults(func=cmd_navigate)
 
     # click
     p = subparsers.add_parser("click", help="Click element")
-    p.add_argument("selector", help="Element selector")
+    p.add_argument("selector", nargs="?", help="Element selector (or use --ref)")
+    p.add_argument("--ref", help="Element ref from snapshot (e.g., e5)")
     p.add_argument("--double", action="store_true", help="Double click")
     p.add_argument("--button", choices=["left", "right", "middle"], default="left")
     p.add_argument("--modifiers", nargs="*", help="Modifier keys")
+    p.add_argument("--no-snapshot", action="store_true", help="Don't include snapshot in result")
     p.set_defaults(func=cmd_click)
 
     # type
     p = subparsers.add_parser("type", help="Type text into input")
-    p.add_argument("selector", help="Input selector")
+    p.add_argument("selector", nargs="?", help="Input selector (or use --ref)")
     p.add_argument("text", help="Text to type")
+    p.add_argument("--ref", help="Element ref from snapshot (e.g., e5)")
     p.add_argument("--submit", action="store_true", help="Press Enter after typing")
     p.add_argument("--slowly", action="store_true", help="Type slowly (with delay)")
+    p.add_argument("--no-snapshot", action="store_true", help="Don't include snapshot in result")
     p.set_defaults(func=cmd_type)
 
     # fill-form
@@ -306,13 +330,17 @@ def main():
 
     # select
     p = subparsers.add_parser("select", help="Select dropdown option")
-    p.add_argument("selector", help="Select element selector")
+    p.add_argument("selector", nargs="?", help="Select element selector (or use --ref)")
     p.add_argument("value", help="Option value to select")
+    p.add_argument("--ref", help="Element ref from snapshot (e.g., e5)")
+    p.add_argument("--no-snapshot", action="store_true", help="Don't include snapshot in result")
     p.set_defaults(func=cmd_select)
 
     # hover
     p = subparsers.add_parser("hover", help="Hover over element")
-    p.add_argument("selector", help="Element selector")
+    p.add_argument("selector", nargs="?", help="Element selector (or use --ref)")
+    p.add_argument("--ref", help="Element ref from snapshot (e.g., e5)")
+    p.add_argument("--no-snapshot", action="store_true", help="Don't include snapshot in result")
     p.set_defaults(func=cmd_hover)
 
     # drag

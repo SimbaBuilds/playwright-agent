@@ -26,15 +26,19 @@ _page = None
 _console_messages = []
 _network_requests = []
 _running = True
+_ref_map = {}  # Maps ref IDs to selectors
 
 
-def write_result(success: bool, result=None, error=None):
+def write_result(success: bool, result=None, error=None, snapshot=None):
     """Write result to file."""
-    RESULT_FILE.write_text(json.dumps({
+    out = {
         "success": success,
         "result": result,
         "error": error
-    }, indent=2, default=str))
+    }
+    if snapshot:
+        out["snapshot"] = snapshot
+    RESULT_FILE.write_text(json.dumps(out, indent=2, default=str))
 
 
 def handle_signal(signum, frame):
@@ -91,12 +95,45 @@ def cleanup():
 
 
 # =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def resolve_ref(selector_or_ref):
+    """
+    Resolve a ref (e.g., 'e5') to a selector, or return the selector as-is.
+    """
+    if selector_or_ref and selector_or_ref.startswith('e') and selector_or_ref[1:].isdigit():
+        # It's a ref, look it up
+        return _ref_map.get(selector_or_ref, selector_or_ref)
+    return selector_or_ref
+
+
+def get_snapshot_yaml():
+    """Get a quick snapshot in YAML format for inclusion in action results."""
+    try:
+        # Wait briefly for page to stabilize after action
+        _page.wait_for_load_state("domcontentloaded", timeout=5000)
+        result = handle_snapshot({"format": "yaml"})
+        if result.get("success"):
+            return result["result"].get("snapshot", "")
+        return ""
+    except Exception as e:
+        return f"[Snapshot error: {e}]"
+
+
+# =============================================================================
 # COMMAND HANDLERS
 # =============================================================================
 
 def handle_navigate(args):
     _page.goto(args["url"], wait_until="networkidle", timeout=30000)
-    return {"success": True, "result": f"Navigated to {args['url']}"}
+    result = {"success": True, "result": f"Navigated to {args['url']}"}
+
+    # Include snapshot if requested
+    if args.get("snapshot", True):
+        result["snapshot"] = get_snapshot_yaml()
+
+    return result
 
 
 def handle_click(args):
@@ -108,20 +145,40 @@ def handle_click(args):
     if args.get("modifiers"):
         click_opts["modifiers"] = args["modifiers"]
 
-    _page.click(args["selector"], **click_opts)
-    return {"success": True, "result": f"Clicked: {args['selector']}"}
+    # Support both 'selector' and 'ref' arguments
+    selector = args.get("selector") or args.get("ref")
+    selector = resolve_ref(selector)
+
+    _page.click(selector, **click_opts)
+    result = {"success": True, "result": f"Clicked: {selector}"}
+
+    # Include snapshot if requested (default: True)
+    if args.get("snapshot", True):
+        result["snapshot"] = get_snapshot_yaml()
+
+    return result
 
 
 def handle_type(args):
+    # Support both 'selector' and 'ref' arguments
+    selector = args.get("selector") or args.get("ref")
+    selector = resolve_ref(selector)
+
     if args.get("slowly"):
-        _page.type(args["selector"], args["text"], delay=100)
+        _page.type(selector, args["text"], delay=100)
     else:
-        _page.fill(args["selector"], args["text"])
+        _page.fill(selector, args["text"])
 
     if args.get("submit"):
-        _page.press(args["selector"], "Enter")
+        _page.press(selector, "Enter")
 
-    return {"success": True, "result": f"Typed into {args['selector']}"}
+    result = {"success": True, "result": f"Typed into {selector}"}
+
+    # Include snapshot if requested (default: True)
+    if args.get("snapshot", True):
+        result["snapshot"] = get_snapshot_yaml()
+
+    return result
 
 
 def handle_fill_form(args):
@@ -130,6 +187,7 @@ def handle_fill_form(args):
 
     for field in fields:
         selector = field.get("selector") or field.get("ref")
+        selector = resolve_ref(selector)
         value = field.get("value")
         field_type = field.get("type", "text")
 
@@ -147,17 +205,35 @@ def handle_fill_form(args):
 
         filled.append(selector)
 
-    return {"success": True, "result": f"Filled {len(filled)} fields"}
+    result = {"success": True, "result": f"Filled {len(filled)} fields"}
+
+    # Include snapshot if requested (default: True)
+    if args.get("snapshot", True):
+        result["snapshot"] = get_snapshot_yaml()
+
+    return result
 
 
 def handle_select(args):
-    _page.select_option(args["selector"], args["value"])
-    return {"success": True, "result": f"Selected '{args['value']}'"}
+    selector = args.get("selector") or args.get("ref")
+    selector = resolve_ref(selector)
+    _page.select_option(selector, args["value"])
+
+    result = {"success": True, "result": f"Selected '{args['value']}'"}
+    if args.get("snapshot", True):
+        result["snapshot"] = get_snapshot_yaml()
+    return result
 
 
 def handle_hover(args):
-    _page.hover(args["selector"])
-    return {"success": True, "result": f"Hovering over {args['selector']}"}
+    selector = args.get("selector") or args.get("ref")
+    selector = resolve_ref(selector)
+    _page.hover(selector)
+
+    result = {"success": True, "result": f"Hovering over {selector}"}
+    if args.get("snapshot", True):
+        result["snapshot"] = get_snapshot_yaml()
+    return result
 
 
 def handle_drag(args):
@@ -209,41 +285,167 @@ def handle_screenshot(args):
 
 
 def handle_snapshot(args):
+    """
+    Improved snapshot that:
+    - Includes ALL form elements (inputs, selects, textareas, buttons)
+    - Adds element refs (e1, e2, etc.) for direct interaction
+    - Shows element states (disabled, checked, selected, etc.)
+    - Uses cleaner YAML-like output format
+    """
+    global _ref_map
+    _ref_map = {}  # Reset ref map
+
     snapshot_script = """
     () => {
+        let refCounter = 0;
+        const refMap = {};
+
+        function getRef(element) {
+            const ref = 'e' + (++refCounter);
+            // Store selector info for later use
+            let selector = '';
+            if (element.id) {
+                selector = '#' + element.id;
+            } else if (element.name) {
+                selector = `[name="${element.name}"]`;
+            } else {
+                // Build a unique selector
+                const tag = element.tagName.toLowerCase();
+                const text = element.textContent?.trim().slice(0, 30);
+                if (text && ['button', 'a', 'label'].includes(tag)) {
+                    selector = `${tag}:has-text("${text.replace(/"/g, '\\\\"')}")`;
+                } else {
+                    selector = `${tag}:nth-of-type(${Array.from(element.parentElement?.children || []).filter(e => e.tagName === element.tagName).indexOf(element) + 1})`;
+                }
+            }
+            refMap[ref] = selector;
+            return ref;
+        }
+
+        function getStates(element) {
+            const states = [];
+            const tag = element.tagName.toLowerCase();
+
+            if (element.disabled) states.push('disabled');
+            if (element.checked) states.push('checked');
+            if (element.selected) states.push('selected');
+            if (element.readOnly) states.push('readonly');
+            if (element.required) states.push('required');
+            if (document.activeElement === element) states.push('focused');
+            if (element.getAttribute('aria-expanded') === 'true') states.push('expanded');
+            if (element.getAttribute('aria-hidden') === 'true') states.push('hidden');
+
+            return states;
+        }
+
+        function formatNode(node, indent = 0) {
+            const pad = '  '.repeat(indent);
+            let line = pad + '- ';
+
+            // Determine role/type
+            const tag = node.tag;
+            const role = node.role || tag;
+
+            // Format: role "name" [states] [ref=X]
+            if (['input', 'select', 'textarea', 'button', 'a'].includes(tag) || node.role) {
+                line += role;
+                if (node.name) line += ` "${node.name}"`;
+                if (node.states && node.states.length) line += ' [' + node.states.join('] [') + ']';
+                if (node.ref) line += ` [ref=${node.ref}]`;
+                if (node.value) line += `: "${node.value}"`;
+            } else {
+                line += tag;
+                if (node.name) line += ` "${node.name}"`;
+                if (node.ref) line += ` [ref=${node.ref}]`;
+            }
+
+            let result = line;
+            if (node.children && node.children.length) {
+                result += '\\n' + node.children.map(c => formatNode(c, indent + 1)).join('\\n');
+            }
+            return result;
+        }
+
         function getTree(element, depth = 0) {
-            if (depth > 8) return null;
+            if (depth > 12) return null;
+            if (!element || element.nodeType !== 1) return null;
 
             const tag = element.tagName.toLowerCase();
-            const role = element.getAttribute('role') || tag;
-            const name = element.getAttribute('aria-label') ||
-                         element.getAttribute('alt') ||
-                         element.getAttribute('title') ||
-                         element.getAttribute('placeholder') ||
-                         (tag === 'input' ? element.value : '') ||
-                         (['a', 'button', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'label', 'span', 'p'].includes(tag) ?
-                          element.textContent?.trim().slice(0, 80) : '');
 
-            const isInteractive = ['a', 'button', 'input', 'select', 'textarea', 'details', 'summary'].includes(tag) ||
-                                  element.getAttribute('role') ||
-                                  element.getAttribute('onclick') ||
+            // Skip script, style, svg internals, hidden elements
+            if (['script', 'style', 'noscript', 'template'].includes(tag)) return null;
+            if (element.getAttribute('aria-hidden') === 'true' && depth > 2) return null;
+
+            const role = element.getAttribute('role');
+            const ariaLabel = element.getAttribute('aria-label');
+            const placeholder = element.getAttribute('placeholder');
+            const title = element.getAttribute('title');
+            const alt = element.getAttribute('alt');
+
+            // Determine display name
+            let name = ariaLabel || alt || title || placeholder || '';
+            if (!name && ['button', 'a', 'label', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'span', 'li', 'td', 'th'].includes(tag)) {
+                // Get direct text content, not from children
+                const directText = Array.from(element.childNodes)
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .join(' ')
+                    .trim();
+                name = directText || element.textContent?.trim().slice(0, 60) || '';
+            }
+
+            // Is this an interactive/important element?
+            const isFormElement = ['input', 'select', 'textarea', 'button'].includes(tag);
+            const isLink = tag === 'a' && element.href;
+            const isInteractive = isFormElement || isLink ||
+                                  role ||
+                                  element.hasAttribute('onclick') ||
                                   element.hasAttribute('tabindex');
 
+            const states = getStates(element);
+
+            // Build node
             const node = {
                 tag: tag,
-                ...(role !== tag && { role: role }),
-                ...(name && { name: name }),
-                ...(element.id && { id: element.id }),
-                ...(element.className && typeof element.className === 'string' &&
-                    element.className.trim() && { class: element.className.split(' ').slice(0, 2).join(' ') }),
-                ...(tag === 'a' && { href: element.getAttribute('href')?.slice(0, 50) }),
-                ...(tag === 'input' && { type: element.type, inputName: element.name }),
-                ...(tag === 'img' && { src: element.src?.slice(0, 50) }),
             };
 
-            const structuralTags = ['div', 'section', 'main', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li',
-                                    'article', 'aside', 'table', 'tbody', 'tr', 'td', 'th'];
+            // Add role if different from tag
+            if (role) node.role = role;
 
+            // Add ref for interactive elements
+            if (isInteractive) {
+                node.ref = getRef(element);
+            }
+
+            // Add name
+            if (name) node.name = name.slice(0, 80);
+
+            // Add states
+            if (states.length) node.states = states;
+
+            // Add type-specific attributes
+            if (tag === 'input') {
+                node.type = element.type || 'text';
+                if (element.type !== 'password' && element.value) {
+                    node.value = element.value.slice(0, 50);
+                }
+                if (placeholder) node.placeholder = placeholder;
+            }
+            if (tag === 'select') {
+                const selected = element.options[element.selectedIndex];
+                if (selected) node.value = selected.text;
+            }
+            if (tag === 'textarea' && element.value) {
+                node.value = element.value.slice(0, 50);
+            }
+            if (tag === 'a' && element.href) {
+                node.href = element.href.slice(0, 50);
+            }
+            if (tag === 'img' && element.src) {
+                node.src = element.src.slice(0, 50);
+            }
+
+            // Get children
             const children = Array.from(element.children)
                 .map(child => getTree(child, depth + 1))
                 .filter(c => c !== null);
@@ -252,27 +454,52 @@ def handle_snapshot(args):
                 node.children = children;
             }
 
-            if (isInteractive || children.length > 0 || name) {
+            // Include node if: interactive, has name, has children, or is structural
+            const structuralTags = ['div', 'section', 'main', 'nav', 'header', 'footer', 'form', 'ul', 'ol', 'li',
+                                    'article', 'aside', 'table', 'tbody', 'tr', 'td', 'th', 'fieldset', 'legend'];
+
+            if (isInteractive || name || children.length > 0 || (structuralTags.includes(tag) && children.length > 0)) {
                 return node;
             }
+
             return null;
         }
+
+        const tree = getTree(document.body);
 
         return {
             url: window.location.href,
             title: document.title,
-            tree: getTree(document.body)
+            tree: tree,
+            refMap: refMap,
+            yaml: tree ? formatNode(tree) : ''
         };
     }
     """
 
     snapshot = _page.evaluate(snapshot_script)
 
+    # Store ref map for later use
+    _ref_map = snapshot.get("refMap", {})
+
+    # Format output based on args
+    output_format = args.get("format", "yaml")
+
+    if output_format == "yaml":
+        result = {
+            "url": snapshot["url"],
+            "title": snapshot["title"],
+            "snapshot": snapshot.get("yaml", ""),
+            "refCount": len(_ref_map)
+        }
+    else:
+        result = snapshot
+
     if args.get("output"):
-        Path(args["output"]).write_text(json.dumps(snapshot, indent=2))
+        Path(args["output"]).write_text(json.dumps(result, indent=2))
         return {"success": True, "result": f"Snapshot saved to {args['output']}"}
     else:
-        return {"success": True, "result": snapshot}
+        return {"success": True, "result": result}
 
 
 def handle_resize(args):
@@ -457,7 +684,12 @@ def main():
                     if handler:
                         try:
                             result = handler(args)
-                            write_result(result.get("success", True), result.get("result"), result.get("error"))
+                            write_result(
+                                result.get("success", True),
+                                result.get("result"),
+                                result.get("error"),
+                                result.get("snapshot")
+                            )
                         except Exception as e:
                             write_result(False, error=str(e))
                     else:
